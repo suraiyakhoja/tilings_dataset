@@ -1,184 +1,167 @@
-import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
-os.environ["TF_NUM_INTEROP_THREADS"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+import tensorflow as tf from tensorflow 
+import keras from tensorflow.keras 
+import layers 
+import numpy as np 
+from sklearn.metrics import accuracy_score, precision_score, recall_score 
+import os 
+# ===================== 
+# CONFIG 
+# ===================== 
 
-import streamlit as st
-import tensorflow as tf
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from PIL import Image
-from sklearn.metrics import confusion_matrix
+img_size = 224 
+batch_size = 32 
+data_dir = "tilings_dataset" 
+seed = 42 
 
+# ===================== 
+# LOAD TRAIN SET # 
 # =====================
-# CONFIG
-# =====================
-st.set_page_config(
-    page_title="Architectural Tiling Classification Dashboard",
-    layout="wide"
+
+train_ds = tf.keras.preprocessing.image_dataset_from_directory( 
+    data_dir, 
+    validation_split=0.2, 
+    subset="training", 
+    seed=seed, 
+    image_size=(img_size, img_size), 
+    batch_size=batch_size 
+) 
+
+# ===================== 
+# LOAD FULL VALIDATION (will split into val + test) 
+# ===================== 
+val_full = tf.keras.preprocessing.image_dataset_from_directory( 
+    data_dir, 
+    validation_split=0.2, 
+    subset="validation", 
+    seed=seed, 
+    image_size=(img_size, img_size), 
+    batch_size=batch_size, 
+    shuffle=True 
 )
 
+class_names = train_ds.class_names 
+print("Classes:", class_names) 
+
+# ===================== 
+# SPLIT VALIDATION → VAL + TEST 
+# ===================== 
+val_batches = tf.data.experimental.cardinality(val_full) 
+test_ds = val_full.take(val_batches // 2) 
+val_ds = val_full.skip(val_batches // 2) 
+
+# ===================== 
+# PREFETCH
 # =====================
-# CONSTANTS
+AUTOTUNE = tf.data.AUTOTUNE 
+train_ds = train_ds.prefetch(AUTOTUNE) 
+val_ds = val_ds.prefetch(AUTOTUNE) 
+test_ds = test_ds.prefetch(AUTOTUNE) 
+
+
+# ===================== 
+# DATA AUGMENTATION 
+# ===================== 
+augment = keras.Sequential([ 
+    layers.RandomFlip("horizontal_and_vertical"), 
+    layers.RandomRotation(0.25), 
+    layers.RandomZoom(0.2), 
+    layers.RandomContrast(0.2), 
+]) 
+
+train_ds = train_ds.map(lambda x, y: (augment(x), y)) 
+
+# ===================== 
+# BASE MODEL 
 # =====================
-DATA_DIR = "tilings_dataset"
-CLASS_NAMES = sorted([
-    d for d in os.listdir(DATA_DIR)
-    if os.path.isdir(os.path.join(DATA_DIR, d))
-])
-IMG_SIZE = 224
-VALID_EXTENSIONS = (".jpg", ".jpeg", ".png")
+base_model = keras.applications.MobileNetV2( 
+    input_shape=(img_size, img_size, 3), 
+    include_top=False, 
+    weights="imagenet" 
+) 
 
+base_model.trainable = False 
+
+# ===================== 
+# CLASSIFIER HEAD 
+# ===================== 
+inputs = keras.Input(shape=(img_size, img_size, 3)) 
+x = keras.applications.mobilenet_v2.preprocess_input(inputs) 
+x = augment(x) 
+x = base_model(x, training=False) 
+x = layers.GlobalAveragePooling2D()(x) 
+x = layers.Dropout(0.3)(x) 
+x = layers.Dense(128, activation="relu")(x) 
+x = layers.Dropout(0.2)(x) 
+outputs = layers.Dense(len(class_names), activation="softmax")(x) 
+
+model = keras.Model(inputs, outputs)
+
+model.compile( 
+    optimizer=keras.optimizers.Adam(1e-3), 
+    loss="sparse_categorical_crossentropy", 
+    metrics=["accuracy"] 
+) 
+
+model.summary() 
+
+# ===================== 
+# TRAIN HEAD 
+# ===================== 
+model.fit( 
+    train_ds, 
+    validation_data=val_ds, 
+    epochs=10 
+) 
+
+# ===================== 
+# FINE-TUNE LAST 30 LAYERS 
 # =====================
-# LOAD MODEL
-# =====================
-@st.cache_resource
-def load_model():
-    return tf.keras.models.load_model("tiling_classifier.keras", compile=False)
+base_model.trainable = True 
+for layer in base_model.layers[:-30]: 
+    layer.trainable = False 
 
-model = load_model()
-print("Model loaded!")
+model.compile( 
+    optimizer=keras.optimizers.Adam(1e-5), 
+    loss="sparse_categorical_crossentropy", 
+    metrics=["accuracy"] 
+) 
 
-# =====================
-# TITLE & INTRO
-# =====================
-st.title("Architectural Tiling Pattern Classification Dashboard")
-st.markdown("""
-This dashboard presents a computer vision model trained to classify 
-architectural tiling patterns based on rotational symmetry. 
-It supports visual analysis, model evaluation, and interactive predictions.
-""")
+early = keras.callbacks.EarlyStopping( 
+    patience=5, 
+    restore_best_weights=True 
+) 
 
-# =====================
-# DATASET OVERVIEW
-# =====================
-st.header("1. Dataset Overview")
-
-# Class counts (only image files)
-class_counts = {}
-for cls in CLASS_NAMES:
-    cls_path = os.path.join(DATA_DIR, cls)
-    if os.path.isdir(cls_path):
-        class_counts[cls] = len([
-            f for f in os.listdir(cls_path)
-            if f.lower().endswith(VALID_EXTENSIONS)
-        ])
-
-# Plot class distribution
-fig, ax = plt.subplots()
-ax.bar(class_counts.keys(), class_counts.values())
-ax.set_title("Class Distribution")
-ax.set_xlabel("Tiling Class")
-ax.set_ylabel("Number of Images")
-
-# Sample images (only image files)
-sample_images = []
-sample_captions = []
-for cls in CLASS_NAMES:
-    cls_path = os.path.join(DATA_DIR, cls)
-    imgs = [f for f in os.listdir(cls_path) if f.lower().endswith(VALID_EXTENSIONS)]
-    if imgs:
-        sample_images.append(Image.open(os.path.join(cls_path, imgs[0])))
-        sample_captions.append(cls)
-
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("Class Distribution")
-    st.pyplot(fig)
-with col2:
-    st.subheader("Sample Images")
-    st.image(sample_images, caption=sample_captions, width=120)
-
-# =====================
-# MODEL PERFORMANCE
-# =====================
-st.header("2. Model Performance")
-
-# Hardcoded metrics (from test set evaluation)
-accuracy = 0.60
-precision = 0.56
-recall = 0.60
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Accuracy", f"{accuracy:.2%}")
-col2.metric("Precision", f"{precision:.2%}")
-col3.metric("Recall", f"{recall:.2%}")
-
-# Confusion matrix
-cm = np.array([
-    [25, 3, 2, 1],
-    [4, 20, 2, 1],
-    [2, 3, 22, 2],
-    [1, 2, 3, 18]
-])
-
-fig_cm, ax = plt.subplots()
-sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax)
-ax.set_xlabel("Predicted")
-ax.set_ylabel("Actual")
-ax.set_title("Confusion Matrix")
-st.pyplot(fig_cm)
-
-# =====================
-# PREDICTION CONFIDENCE
-# =====================
-st.header("3. Prediction Confidence Distribution")
-
-# Simulated confidence values
-confidences = np.random.uniform(0.5, 1.0, 300)
-fig_conf, ax = plt.subplots()
-ax.hist(confidences, bins=20)
-ax.set_xlabel("Confidence Score")
-ax.set_ylabel("Frequency")
-ax.set_title("Model Prediction Confidence")
-st.pyplot(fig_conf)
-
-# =====================
-# INTERACTIVE PREDICTION TOOL
-# =====================
-st.header("4. Interactive Prediction Tool")
-
-uploaded_file = st.file_uploader(
-    "Upload a tiling image",
-    type=["jpg", "jpeg", "png"]
+model.fit( 
+    train_ds, 
+    validation_data=val_ds, 
+    epochs=30, 
+    callbacks=[early] 
 )
 
-threshold = st.slider(
-    "Confidence Threshold",
-    min_value=0.5,
-    max_value=0.95,
-    value=0.7,
-    step=0.05
-)
+# ===================== 
+# TEST SET EVALUATION 
+# ===================== 
+print("\n📊 Evaluating on test set...") 
+y_true = [] 
+y_pred = [] 
 
-def predict(image):
-    image = image.resize((IMG_SIZE, IMG_SIZE))
-    image_array = tf.keras.applications.mobilenet_v2.preprocess_input(np.array(image))
-    image_array = np.expand_dims(image_array, axis=0)
-    preds = model.predict(image_array)
-    confidence = float(np.max(preds))
-    predicted_class = CLASS_NAMES[np.argmax(preds)]
-    return predicted_class, confidence
+for images, labels in test_ds: 
+    preds = model.predict(images) 
+    y_true.extend(labels.numpy()) 
+    y_pred.extend(np.argmax(preds, axis=1)) 
 
-if uploaded_file:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded Image", width=250)
-    prediction, confidence = predict(image)
-    if confidence >= threshold:
-        st.success(f"Prediction: {prediction} ({confidence:.2%})")
-    else:
-        st.warning(f"Low confidence prediction ({confidence:.2%}) – manual review recommended.")
+y_true = np.array(y_true) 
+y_pred = np.array(y_pred) 
+
+print("\n✅ Test Set Performance") 
+print("Accuracy :", accuracy_score(y_true, y_pred)) 
+print("Precision:", precision_score(y_true, y_pred, average="weighted")) 
+print("Recall :", recall_score(y_true, y_pred, average="weighted")) 
+
 
 # =====================
-# INSIGHTS + RECOMMENDATIONS
-# =====================
-st.header("5. Key Insights & Recommendations")
-st.markdown("""
-- The model performs best on dominant symmetry classes such as 4-fold and 6-fold.  
-- Visually similar patterns are the most common source of misclassification.  
-- Applying a confidence threshold improves reliability in decision-making.  
-- This tool is best used as decision support, not full automation.  
-""")
+# SAVE MODEL 
+# ===================== 
+model.save("tiling_classifier.keras") 
+
+print("\nModel saved as tiling_classifier.keras")
