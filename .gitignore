@@ -4,7 +4,6 @@ __pycache__/
 
 /venv
 
-/tilings_dataset
 /tilings_dataset_backup
 
 /tiling_classifier_2classes.h5
