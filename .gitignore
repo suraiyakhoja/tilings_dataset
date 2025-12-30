@@ -1,0 +1,16 @@
+/.DS_Store
+__pycache__/
+*.pyc
+
+/venv
+
+/tilings_dataset
+/tilings_dataset_backup
+
+/tiling_classifier_2classes.h5
+/tiling_classifier_2classes.keras
+/tiling_classifier.keras
+
+
+
+
